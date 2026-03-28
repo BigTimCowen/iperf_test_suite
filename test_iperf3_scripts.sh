@@ -1,17 +1,22 @@
 #!/usr/bin/env bash
 #===============================================================================
 # test_iperf3_scripts.sh — Functional & unit tests for the iperf3 test suite
+# Note: set -e is intentionally omitted so test failures don't abort the suite.
 #===============================================================================
 set -uo pipefail
+
+SCRIPT_VERSION="1.2.1"
+# shellcheck disable=SC2034
+SCRIPT_VERSION_DATE="2026-03-28"
 
 PASS=0; FAIL=0; SKIP=0
 RED='\033[0;31m'; GRN='\033[0;32m'; YEL='\033[0;33m'; CYN='\033[0;36m'; BLD='\033[1m'; DIM='\033[2m'; RST='\033[0m'
 
-SCRIPT_DIR="/home/claude"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CLIENT="$SCRIPT_DIR/iperf3_client.sh"
 SERVER="$SCRIPT_DIR/iperf3_server.sh"
 TUNER="$SCRIPT_DIR/iperf3_tune_host.sh"
-TESTDIR=$(mktemp -d /tmp/iperf3_tests.XXXXXX)
+TESTDIR=$(mktemp -d /tmp/iperf3_tests.XXXXXXXXXX)
 trap 'rm -rf "$TESTDIR"' EXIT
 
 assert_pass() {
@@ -80,19 +85,19 @@ skip_test() {
     SKIP=$(( SKIP + 1 ))
 }
 
-echo -e "\n${BLD}╔══════════════════════════════════════════════════════════════╗${RST}"
-echo -e "${BLD}║         iperf3 Script Test Suite                            ║${RST}"
-echo -e "${BLD}╚══════════════════════════════════════════════════════════════╝${RST}\n"
+echo -e "\n${BLD}======================================================================${RST}"
+echo -e "${BLD}         iperf3 Script Test Suite v${SCRIPT_VERSION}${RST}"
+echo -e "${BLD}======================================================================${RST}\n"
 
 #===============================================================================
-echo -e "${BLD}── 1. Syntax Validation ──${RST}"
+echo -e "${BLD}-- 1. Syntax Validation --${RST}"
 #===============================================================================
 assert_pass "client.sh syntax valid"  bash -n "$CLIENT"
 assert_pass "server.sh syntax valid"  bash -n "$SERVER"
 assert_pass "tuner.sh syntax valid"   bash -n "$TUNER"
 
 #===============================================================================
-echo -e "\n${BLD}── 2. Argument Parsing ──${RST}"
+echo -e "\n${BLD}-- 2. Argument Parsing --${RST}"
 #===============================================================================
 
 # Help flags
@@ -101,13 +106,17 @@ assert_contains "client --help shows usage"    "Usage:" "$out"
 assert_contains "client --help shows --raw"    "--raw" "$out"
 assert_contains "client --help shows --target" "--target" "$out"
 assert_contains "client --help shows --yes"    "--yes" "$out"
+assert_contains "client --help shows --debug"  "--debug" "$out"
+assert_contains "client --help shows version"  "$SCRIPT_VERSION" "$out"
 
 out=$(bash "$SERVER" --help 2>&1) || true
-assert_contains "server --help shows usage" "Usage:" "$out"
-assert_contains "server --help shows --yes" "--yes" "$out"
+assert_contains "server --help shows usage"   "Usage:" "$out"
+assert_contains "server --help shows --yes"   "--yes" "$out"
+assert_contains "server --help shows version" "$SCRIPT_VERSION" "$out"
 
 out=$(bash "$TUNER" --help 2>&1) || true
-assert_contains "tuner --help shows usage" "Usage:" "$out"
+assert_contains "tuner --help shows usage"   "Usage:" "$out"
+assert_contains "tuner --help shows version" "$SCRIPT_VERSION" "$out"
 
 # Missing required arg
 assert_fail "client fails without --server" bash "$CLIENT"
@@ -118,7 +127,41 @@ assert_fail "server rejects --bogus" bash "$SERVER" --bogus
 assert_fail "tuner rejects --bogus"  bash "$TUNER" --bogus
 
 #===============================================================================
-echo -e "\n${BLD}── 3. JSON Helper Functions ──${RST}"
+echo -e "\n${BLD}-- 3. Input Validation --${RST}"
+#===============================================================================
+
+# Server validation
+assert_fail "server rejects --instances 0"    bash "$SERVER" --instances 0 --yes
+assert_fail "server rejects --instances -1"   bash "$SERVER" --instances -1 --yes
+assert_fail "server rejects --instances abc"  bash "$SERVER" --instances abc --yes
+assert_fail "server rejects --base-port 99999" bash "$SERVER" --base-port 99999 --yes
+assert_fail "server rejects --base-port 80"   bash "$SERVER" --base-port 80 --yes
+assert_fail "server rejects missing --instances arg" bash "$SERVER" --instances
+
+# Client validation
+assert_fail "client rejects --instances 0"    bash "$CLIENT" --server 1.2.3.4 --instances 0 --yes
+assert_fail "client rejects --duration 0"     bash "$CLIENT" --server 1.2.3.4 --duration 0 --yes
+assert_fail "client rejects --streams-per 0"  bash "$CLIENT" --server 1.2.3.4 --streams-per 0 --yes
+assert_fail "client rejects --base-port 99999" bash "$CLIENT" --server 1.2.3.4 --base-port 99999 --yes
+assert_fail "client rejects --window bad"     bash "$CLIENT" --server 1.2.3.4 --window "bad" --yes
+assert_fail "client rejects --interface ../../etc" bash "$CLIENT" --server 1.2.3.4 --interface "../../etc" --yes
+assert_fail "client rejects missing --server arg" bash "$CLIENT" --server
+
+# Tuner validation
+assert_fail "tuner rejects --interface ../../etc" bash "$TUNER" --interface "../../etc"
+assert_fail "tuner rejects missing --interface arg" bash "$TUNER" --interface
+
+# Verify error messages are user-friendly (not raw bash errors)
+out=$(bash "$SERVER" --instances abc 2>&1) || true
+assert_contains "server validation msg is friendly" "must be a positive integer" "$out"
+assert_not_contains "server validation no bash error" "unbound variable" "$out"
+
+out=$(bash "$CLIENT" --server 2>&1) || true
+assert_contains "client missing arg msg is friendly" "requires an argument" "$out"
+assert_not_contains "client missing arg no bash error" "unbound variable" "$out"
+
+#===============================================================================
+echo -e "\n${BLD}-- 4. JSON Helper Functions --${RST}"
 #===============================================================================
 
 # Create test JSON files
@@ -166,7 +209,7 @@ import json, sys
 try:
     d = json.load(open(sys.argv[1]))
     for k in sys.argv[2].split('.'):
-        d = d[k]
+        d = d[int(k)] if isinstance(d, list) else d[k]
     print(d)
 except Exception:
     print(sys.argv[3])
@@ -221,6 +264,16 @@ except Exception as e:
 " "$1" 2>/dev/null
 }
 
+# safe_number helper (matching client script)
+safe_number() {
+    local val="$1" default="${2:-0}"
+    if [[ "$val" =~ ^-?[0-9]*\.?[0-9]+([eE][+-]?[0-9]+)?$ ]]; then
+        echo "$val"
+    else
+        echo "$default"
+    fi
+}
+
 # json_val tests
 result=$(json_val "$TESTDIR/good.json" "end.sum_sent.bytes" 0)
 assert_eq "json_val: extract bytes" "156000000000" "$result"
@@ -257,7 +310,7 @@ result=$(json_error "$TESTDIR/empty.json")
 assert_eq "json_error: empty file returns parse error" "JSON parse error" "$result"
 
 #===============================================================================
-echo -e "\n${BLD}── 4. json_pretty (--raw) Output ──${RST}"
+echo -e "\n${BLD}-- 5. json_pretty (--raw) Output --${RST}"
 #===============================================================================
 
 raw_out=$(json_pretty "$TESTDIR/good.json")
@@ -273,7 +326,7 @@ raw_bad=$(json_pretty "$TESTDIR/bad.json")
 assert_contains "json_pretty: bad JSON shows error" "could not parse" "$raw_bad"
 
 #===============================================================================
-echo -e "\n${BLD}── 5. Integer Sanitization ──${RST}"
+echo -e "\n${BLD}-- 6. Integer Sanitization --${RST}"
 #===============================================================================
 
 # Test printf %.0f with various inputs (matching how the script sanitizes)
@@ -292,7 +345,19 @@ total=$(( 0 + sent_bytes ))
 assert_eq "bash arithmetic with sanitized value" "156000000000" "$total"
 
 #===============================================================================
-echo -e "\n${BLD}── 6. bc Calculations ──${RST}"
+echo -e "\n${BLD}-- 7. safe_number Validation --${RST}"
+#===============================================================================
+
+assert_eq "safe_number: valid int"       "42"              "$(safe_number 42 0)"
+assert_eq "safe_number: valid float"     "3.14"            "$(safe_number 3.14 0)"
+assert_eq "safe_number: valid sci"       "1.5e+10"         "$(safe_number 1.5e+10 0)"
+assert_eq "safe_number: valid negative"  "-5.2"            "$(safe_number -5.2 0)"
+assert_eq "safe_number: invalid string"  "0"               "$(safe_number "abc" 0)"
+assert_eq "safe_number: empty default"   "0"               "$(safe_number "" 0)"
+assert_eq "safe_number: injection attempt" "0"             "$(safe_number "1;rm -rf /" 0)"
+
+#===============================================================================
+echo -e "\n${BLD}-- 8. bc Calculations --${RST}"
 #===============================================================================
 
 # Test the exact bc expressions used in the script
@@ -331,7 +396,7 @@ result=$(echo "scale=1; 0 * 100 / 200" | bc 2>&1)
 assert_eq "bc: zero throughput percentage" "0" "$result"
 
 #===============================================================================
-echo -e "\n${BLD}── 7. Window Size Parsing ──${RST}"
+echo -e "\n${BLD}-- 9. Window Size Parsing --${RST}"
 #===============================================================================
 
 # Simulate the window parsing logic from the script
@@ -340,16 +405,16 @@ for test_case in "128M:134217728" "64K:65536" "1G:1073741824" "256M:268435456"; 
     expected="${test_case##*:}"
     req_bytes=0
     case "$window" in
-        *M) req_bytes=$(( ${window%M} * 1024 * 1024 )) ;;
-        *K) req_bytes=$(( ${window%K} * 1024 )) ;;
-        *G) req_bytes=$(( ${window%G} * 1024 * 1024 * 1024 )) ;;
-        *)  req_bytes=$window ;;
+        *[Mm]) req_bytes=$(( ${window%[Mm]} * 1024 * 1024 )) ;;
+        *[Kk]) req_bytes=$(( ${window%[Kk]} * 1024 )) ;;
+        *[Gg]) req_bytes=$(( ${window%[Gg]} * 1024 * 1024 * 1024 )) ;;
+        *)     req_bytes=$window ;;
     esac
     assert_eq "window parse: $window = $expected bytes" "$expected" "$req_bytes"
 done
 
 #===============================================================================
-echo -e "\n${BLD}── 8. Interface Auto-Detection ──${RST}"
+echo -e "\n${BLD}-- 10. Interface Auto-Detection --${RST}"
 #===============================================================================
 
 # Check that the script can find a non-eth0 interface
@@ -363,7 +428,7 @@ else
 fi
 
 #===============================================================================
-echo -e "\n${BLD}── 9. NIC Counter Reading ──${RST}"
+echo -e "\n${BLD}-- 11. NIC Counter Reading --${RST}"
 #===============================================================================
 
 # Find any interface to test counter reading
@@ -378,7 +443,7 @@ else
 fi
 
 #===============================================================================
-echo -e "\n${BLD}── 10. Tuning Script Dry Run ──${RST}"
+echo -e "\n${BLD}-- 12. Tuning Script Dry Run --${RST}"
 #===============================================================================
 
 tune_out=$(bash "$TUNER" 2>&1 || true)
@@ -394,10 +459,38 @@ else
     assert_contains "tuner: shows tcp_congestion"      "tcp_congestion_control" "$tune_out"
     assert_contains "tuner: shows interface"           "Interface:" "$tune_out"
     assert_contains "tuner: DRY RUN mode"             "DRY RUN" "$tune_out"
+
+    # CPU governor check
+    if [[ -f /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor ]]; then
+        assert_contains "tuner: shows CPU governor"      "CPU governor" "$tune_out"
+        assert_contains "tuner: shows available governors" "Available governors" "$tune_out"
+    else
+        skip_test "tuner CPU governor check" "no cpufreq sysfs on this host"
+    fi
+
+    # NIC driver/firmware info
+    if command -v ethtool &>/dev/null; then
+        assert_contains "tuner: shows NIC driver/firmware" "driver" "$tune_out"
+    else
+        skip_test "tuner NIC driver info" "ethtool not installed"
+    fi
+
+    # ESnet "other tuning" checks
+    assert_contains "tuner: shows netdev_budget"       "net.core.netdev_budget" "$tune_out"
+    assert_contains "tuner: shows netdev_budget_usecs" "netdev_budget_usecs" "$tune_out"
+    assert_contains "tuner: shows txqueuelen"          "txqueuelen" "$tune_out"
+
+    # LRO/GRO offload checks
+    if command -v ethtool &>/dev/null; then
+        assert_contains "tuner: shows large-receive-offload" "large-receive-offload" "$tune_out"
+        assert_contains "tuner: shows generic-receive-offload" "generic-receive-offload" "$tune_out"
+    else
+        skip_test "tuner LRO/GRO check" "ethtool not installed"
+    fi
 fi
 
 #===============================================================================
-echo -e "\n${BLD}── 11. Tuning Script Auto-Detect Interface ──${RST}"
+echo -e "\n${BLD}-- 13. Tuning Script Auto-Detect Interface --${RST}"
 #===============================================================================
 
 if ! ip link show eth0 &>/dev/null 2>&1; then
@@ -411,7 +504,30 @@ else
 fi
 
 #===============================================================================
-echo -e "\n${BLD}── 12. End-to-End Functional Test (mock) ──${RST}"
+echo -e "\n${BLD}-- 14. Tuning Script Deterministic Order --${RST}"
+#===============================================================================
+
+if [[ -n "$tune_out" ]]; then
+    # rmem_max should appear before tcp_congestion_control in ordered output
+    rmem_line=$(echo "$tune_out" | grep -n 'net.core.rmem_max' | head -1 | cut -d: -f1)
+    cc_line=$(echo "$tune_out" | grep -n 'tcp_congestion_control' | head -1 | cut -d: -f1)
+    if [[ -n "$rmem_line" && -n "$cc_line" ]]; then
+        if (( rmem_line < cc_line )); then
+            echo -e "  ${GRN}PASS${RST}  tuner: parameter order is deterministic (rmem_max before tcp_cc)"
+            PASS=$(( PASS + 1 ))
+        else
+            echo -e "  ${RED}FAIL${RST}  tuner: parameter order is NOT deterministic"
+            FAIL=$(( FAIL + 1 ))
+        fi
+    else
+        skip_test "tuner parameter order" "could not find both parameters in output"
+    fi
+else
+    skip_test "tuner parameter order" "tuner produced no output"
+fi
+
+#===============================================================================
+echo -e "\n${BLD}-- 15. End-to-End Functional Test (mock) --${RST}"
 #===============================================================================
 
 # Create mock JSON results and test the parsing pipeline
@@ -457,9 +573,9 @@ for i in 1 2 3 4; do
     sb=$(json_val "$f" "end.sum_sent.bytes" 0)
     rb=$(json_val "$f" "end.sum_received.bytes" 0)
     rt=$(json_val "$f" "end.sum_sent.retransmits" 0)
-    sb=$(printf '%.0f' "$sb" 2>/dev/null || echo 0)
-    rb=$(printf '%.0f' "$rb" 2>/dev/null || echo 0)
-    rt=$(printf '%.0f' "$rt" 2>/dev/null || echo 0)
+    sb=$(printf '%.0f' "$(safe_number "$sb" 0)" 2>/dev/null || echo 0)
+    rb=$(printf '%.0f' "$(safe_number "$rb" 0)" 2>/dev/null || echo 0)
+    rt=$(printf '%.0f' "$(safe_number "$rt" 0)" 2>/dev/null || echo 0)
     TOTAL_SENT=$(( TOTAL_SENT + sb ))
     TOTAL_RECV=$(( TOTAL_RECV + rb ))
     TOTAL_RETR=$(( TOTAL_RETR + rt ))
@@ -484,7 +600,7 @@ PCT=$(echo "scale=1; $AGG_SENT_GBPS * 100 / 200" | bc)
 assert_eq "e2e: percentage of 200G target" "39.0" "$PCT"
 
 #===============================================================================
-echo -e "\n${BLD}── 13. --raw Output with Mock Data ──${RST}"
+echo -e "\n${BLD}-- 16. --raw Output with Mock Data --${RST}"
 #===============================================================================
 
 raw_out=$(json_pretty "$E2E_DIR/iperf3_s1.json")
@@ -499,7 +615,7 @@ raw_err=$(json_pretty "$E2E_DIR/iperf3_s4.json")
 assert_pass "raw mock: error file doesn't crash json_pretty" test -n "$raw_err"
 
 #===============================================================================
-echo -e "\n${BLD}── 14. Edge Cases ──${RST}"
+echo -e "\n${BLD}-- 17. Edge Cases --${RST}"
 #===============================================================================
 
 # Scientific notation from json_val (iperf3 sometimes outputs this)
@@ -544,7 +660,7 @@ total=$(( 0 + 3000000000000 ))
 assert_eq "edge: bash arithmetic handles 3TB" "3000000000000" "$total"
 
 #===============================================================================
-echo -e "\n${BLD}── 15. No Dangerous Patterns ──${RST}"
+echo -e "\n${BLD}-- 18. No Dangerous Patterns --${RST}"
 #===============================================================================
 
 # Verify no eval remains
@@ -568,12 +684,93 @@ for script in "$CLIENT" "$SERVER" "$TUNER"; do
     assert_eq "no jq calls in $name" "0" "$count"
 done
 
+# Verify no pkill -f (replaced with PID file tracking)
+count=$(grep -c 'pkill -f' "$SERVER" || true)
+assert_eq "no pkill -f in server.sh" "0" "$count"
+
 # Verify no hardcoded eth0 in remediation text
 remediation=$(grep -A 20 'Remediation Checklist' "$CLIENT" 2>/dev/null || true)
 assert_not_contains "no hardcoded eth0 in remediation" "eth0" "$remediation"
 
 #===============================================================================
-echo -e "\n${BLD}── 16. Performance: JSON Helper Speed ──${RST}"
+echo -e "\n${BLD}-- 19. PID File Management --${RST}"
+#===============================================================================
+
+# Test that server creates and cleans up PID files
+PIDFILE_TEST="/tmp/iperf3_server_suite_5200.pids"
+rm -f "$PIDFILE_TEST" 2>/dev/null || true
+
+# Start a minimal server and check PID file creation
+out=$(bash "$SERVER" --instances 1 --base-port 5200 --yes 2>&1) || true
+if [[ -f "$PIDFILE_TEST" ]]; then
+    echo -e "  ${GRN}PASS${RST}  server creates PID file on launch"
+    PASS=$(( PASS + 1 ))
+    pid_content=$(cat "$PIDFILE_TEST")
+    if [[ "$pid_content" =~ ^[0-9]+$ ]]; then
+        echo -e "  ${GRN}PASS${RST}  PID file contains valid PID"
+        PASS=$(( PASS + 1 ))
+    else
+        echo -e "  ${RED}FAIL${RST}  PID file does not contain valid PID: '$pid_content'"
+        FAIL=$(( FAIL + 1 ))
+    fi
+else
+    echo -e "  ${RED}FAIL${RST}  server did NOT create PID file"
+    FAIL=$(( FAIL + 1 ))
+    # Still count second test as fail
+    echo -e "  ${YEL}SKIP${RST}  PID file content check (no file)"
+    SKIP=$(( SKIP + 1 ))
+fi
+
+# Stop and verify cleanup
+out=$(bash "$SERVER" --stop --base-port 5200 --yes 2>&1) || true
+if [[ ! -f "$PIDFILE_TEST" ]]; then
+    echo -e "  ${GRN}PASS${RST}  server cleans up PID file on stop"
+    PASS=$(( PASS + 1 ))
+else
+    echo -e "  ${RED}FAIL${RST}  PID file still exists after stop"
+    FAIL=$(( FAIL + 1 ))
+    rm -f "$PIDFILE_TEST"
+fi
+
+#===============================================================================
+echo -e "\n${BLD}-- 20. Version Constants --${RST}"
+#===============================================================================
+
+for script in "$CLIENT" "$SERVER" "$TUNER"; do
+    name=$(basename "$script")
+    if grep -q 'SCRIPT_VERSION=' "$script"; then
+        echo -e "  ${GRN}PASS${RST}  $name has SCRIPT_VERSION"
+        PASS=$(( PASS + 1 ))
+    else
+        echo -e "  ${RED}FAIL${RST}  $name missing SCRIPT_VERSION"
+        FAIL=$(( FAIL + 1 ))
+    fi
+    if grep -q 'SCRIPT_VERSION_DATE=' "$script"; then
+        echo -e "  ${GRN}PASS${RST}  $name has SCRIPT_VERSION_DATE"
+        PASS=$(( PASS + 1 ))
+    else
+        echo -e "  ${RED}FAIL${RST}  $name missing SCRIPT_VERSION_DATE"
+        FAIL=$(( FAIL + 1 ))
+    fi
+done
+
+#===============================================================================
+echo -e "\n${BLD}-- 21. Debug Flag --${RST}"
+#===============================================================================
+
+for script in "$CLIENT" "$SERVER" "$TUNER"; do
+    name=$(basename "$script")
+    if grep -q '\-\-debug' "$script"; then
+        echo -e "  ${GRN}PASS${RST}  $name supports --debug"
+        PASS=$(( PASS + 1 ))
+    else
+        echo -e "  ${RED}FAIL${RST}  $name missing --debug support"
+        FAIL=$(( FAIL + 1 ))
+    fi
+done
+
+#===============================================================================
+echo -e "\n${BLD}-- 22. Performance: JSON Helper Speed --${RST}"
 #===============================================================================
 
 # Time 100 invocations of json_val to check for performance issues
@@ -604,7 +801,7 @@ done
 #===============================================================================
 # Summary
 #===============================================================================
-echo -e "\n${BLD}════════════════════════════════════════════════════════════════${RST}"
+echo -e "\n${BLD}======================================================================${RST}"
 TOTAL=$(( PASS + FAIL + SKIP ))
 echo -e "${BLD}  Results: ${GRN}$PASS passed${RST}, ${RED}$FAIL failed${RST}, ${YEL}$SKIP skipped${RST}  (${TOTAL} total)${RST}"
 if (( FAIL == 0 )); then
@@ -612,6 +809,6 @@ if (( FAIL == 0 )); then
 else
     echo -e "  ${RED}${BLD}SOME TESTS FAILED${RST}"
 fi
-echo -e "${BLD}════════════════════════════════════════════════════════════════${RST}\n"
+echo -e "${BLD}======================================================================${RST}\n"
 
 exit $FAIL

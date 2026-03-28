@@ -10,9 +10,12 @@
 #                      [--duration SEC] [--streams-per N] [--window SIZE]
 #                      [--target GBPS] [--bind IP] [--interface NAME]
 #                      [--affinity] [--mtu-check] [--raw] [--json-dir DIR]
-#                      [--yes]
+#                      [--yes] [--debug]
 #===============================================================================
 set -euo pipefail
+
+SCRIPT_VERSION="1.2.1"
+SCRIPT_VERSION_DATE="2026-03-28"
 
 #--- Defaults ------------------------------------------------------------------
 SERVER=""
@@ -29,6 +32,7 @@ SHOW_RAW=false        # show raw iperf3 output per process
 JSON_DIR=""
 INTERFACE="eth0"      # interface to monitor
 AUTO_YES=false        # skip confirmations
+DEBUG=false
 
 #--- Color output --------------------------------------------------------------
 RED='\033[0;31m'; GRN='\033[0;32m'; YEL='\033[0;33m'; CYN='\033[0;36m'; BLD='\033[1m'; DIM='\033[2m'; RST='\033[0m'
@@ -38,12 +42,23 @@ warn()  { echo -e "${YEL}[WARN]${RST}  $*"; }
 err()   { echo -e "${RED}[ERROR]${RST} $*"; }
 hdr()   { echo -e "\n${BLD}$*${RST}"; }
 
+#--- Action log ----------------------------------------------------------------
+ACTION_LOG="./iperf3_action.log"
+log_action() {
+    local ts
+    ts=$(date '+%Y-%m-%d %H:%M:%S')
+    echo "[$ts] $*" >> "$ACTION_LOG"
+    echo -e "  ${DIM}[LOG] $*${RST}"
+}
+
 #--- Confirm-before-execute (no eval) ------------------------------------------
 # Usage: confirm_exec "description" command arg1 arg2 ...
 confirm_exec() {
     local desc="$1"; shift
-    echo -e "  ${CYN}▶ ${desc}${RST}"
-    echo -e "    ${DIM}\$ $*${RST}"
+    local cmd_display
+    cmd_display=$(printf '%q ' "$@")
+    echo -e "  ${CYN}> ${desc}${RST}"
+    echo -e "    ${DIM}\$ ${cmd_display}${RST}"
     if $AUTO_YES; then
         echo -e "    ${DIM}(auto-confirmed via --yes)${RST}"
     else
@@ -62,22 +77,45 @@ confirm_exec() {
 #--- Parse arguments -----------------------------------------------------------
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --server|-s)        SERVER="$2";          shift 2 ;;
-        --instances)        INSTANCES="$2";       shift 2 ;;
-        --base-port)        BASE_PORT="$2";       shift 2 ;;
-        --duration|-t)      DURATION="$2";        shift 2 ;;
-        --streams-per|-P)   STREAMS_PER="$2";     shift 2 ;;
-        --window|-w)        WINDOW="$2";          shift 2 ;;
-        --target)           TARGET_GBPS="$2";     shift 2 ;;
-        --bind)             BIND_ADDR="$2";       shift 2 ;;
-        --interface|-I)     INTERFACE="$2";       shift 2 ;;
+        --server|-s)
+            [[ $# -lt 2 ]] && { err "--server requires an argument"; exit 1; }
+            SERVER="$2"; shift 2 ;;
+        --instances)
+            [[ $# -lt 2 ]] && { err "--instances requires an argument"; exit 1; }
+            INSTANCES="$2"; shift 2 ;;
+        --base-port)
+            [[ $# -lt 2 ]] && { err "--base-port requires an argument"; exit 1; }
+            BASE_PORT="$2"; shift 2 ;;
+        --duration|-t)
+            [[ $# -lt 2 ]] && { err "--duration requires an argument"; exit 1; }
+            DURATION="$2"; shift 2 ;;
+        --streams-per|-P)
+            [[ $# -lt 2 ]] && { err "--streams-per requires an argument"; exit 1; }
+            STREAMS_PER="$2"; shift 2 ;;
+        --window|-w)
+            [[ $# -lt 2 ]] && { err "--window requires an argument"; exit 1; }
+            WINDOW="$2"; shift 2 ;;
+        --target)
+            [[ $# -lt 2 ]] && { err "--target requires an argument"; exit 1; }
+            TARGET_GBPS="$2"; shift 2 ;;
+        --bind)
+            [[ $# -lt 2 ]] && { err "--bind requires an argument"; exit 1; }
+            BIND_ADDR="$2"; shift 2 ;;
+        --interface|-I)
+            [[ $# -lt 2 ]] && { err "--interface requires an argument"; exit 1; }
+            INTERFACE="$2"; shift 2 ;;
         --affinity)         CPU_AFFINITY=true;    shift ;;
         --mtu-check)        MTU_CHECK=true;       shift ;;
         --raw)              SHOW_RAW=true;        shift ;;
-        --json-dir)         JSON_DIR="$2";        shift 2 ;;
+        --json-dir)
+            [[ $# -lt 2 ]] && { err "--json-dir requires an argument"; exit 1; }
+            JSON_DIR="$2"; shift 2 ;;
         --yes|-y)           AUTO_YES=true;        shift ;;
+        --debug)            DEBUG=true;           shift ;;
         -h|--help)
-            cat <<'EOF'
+            cat <<EOF
+iperf3_client.sh v${SCRIPT_VERSION} (${SCRIPT_VERSION_DATE})
+
 Usage: iperf3_client.sh --server <IP> [OPTIONS]
 
 Required:
@@ -97,6 +135,7 @@ Options:
   --raw                 Show raw iperf3 per-second output for each process
   --json-dir DIR        Save per-process JSON results to DIR
   --yes, -y             Skip all confirmations (auto-approve)
+  --debug               Enable debug output (set -x)
   -h, --help            Show this help
 EOF
             exit 0 ;;
@@ -104,7 +143,68 @@ EOF
     esac
 done
 
+$DEBUG && set -x
+
+#--- Input validation ----------------------------------------------------------
 [[ -z "$SERVER" ]] && { err "Missing --server <IP>. Use -h for help."; exit 1; }
+
+# Validate server as IPv4 or resolvable hostname
+if ! [[ "$SERVER" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && ! [[ "$SERVER" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]*$ ]]; then
+    err "Invalid server address: '$SERVER'"
+    exit 1
+fi
+
+# Validate numeric arguments
+for var_check in INSTANCES BASE_PORT DURATION STREAMS_PER TARGET_GBPS; do
+    val="${!var_check}"
+    if ! [[ "$val" =~ ^[0-9]+$ ]]; then
+        err "--${var_check,,} must be a positive integer, got '$val'"
+        exit 1
+    fi
+done
+
+if (( INSTANCES < 1 )); then
+    err "--instances must be >= 1, got '$INSTANCES'"
+    exit 1
+fi
+if (( BASE_PORT < 1024 || BASE_PORT > 65535 )); then
+    err "--base-port must be 1024-65535, got '$BASE_PORT'"
+    exit 1
+fi
+if (( BASE_PORT + INSTANCES - 1 > 65535 )); then
+    err "Port range ${BASE_PORT}-$(( BASE_PORT + INSTANCES - 1 )) exceeds 65535"
+    exit 1
+fi
+if (( DURATION < 1 )); then
+    err "--duration must be >= 1, got '$DURATION'"
+    exit 1
+fi
+if (( STREAMS_PER < 1 )); then
+    err "--streams-per must be >= 1, got '$STREAMS_PER'"
+    exit 1
+fi
+if (( TARGET_GBPS < 1 )); then
+    err "--target must be >= 1, got '$TARGET_GBPS'"
+    exit 1
+fi
+
+# Validate --window format (e.g., 128M, 64K, 1G, or bare bytes)
+if [[ -n "$WINDOW" ]] && ! [[ "$WINDOW" =~ ^[0-9]+[KkMmGg]?$ ]]; then
+    err "Invalid window size: '$WINDOW' (expected format: 128M, 64K, 1G, or bare bytes)"
+    exit 1
+fi
+
+# Validate interface name (prevent path traversal into /sys)
+if ! [[ "$INTERFACE" =~ ^[a-zA-Z0-9._-]+$ ]]; then
+    err "Invalid interface name: '$INTERFACE'"
+    exit 1
+fi
+
+# Validate bind address if provided
+if [[ -n "$BIND_ADDR" ]] && ! [[ "$BIND_ADDR" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    err "--bind must be a valid IPv4 address, got '$BIND_ADDR'"
+    exit 1
+fi
 
 #--- Pre-flight: dependency checks ---------------------------------------------
 missing_deps=()
@@ -126,7 +226,7 @@ import json, sys
 try:
     d = json.load(open(sys.argv[1]))
     for k in sys.argv[2].split('.'):
-        d = d[k]
+        d = d[int(k)] if isinstance(d, list) else d[k]
     print(d)
 except Exception:
     print(sys.argv[3])
@@ -188,6 +288,16 @@ except Exception as e:
 " "$1" 2>/dev/null
 }
 
+#--- Numeric validation helper for bc inputs -----------------------------------
+safe_number() {
+    local val="$1" default="${2:-0}"
+    if [[ "$val" =~ ^-?[0-9]*\.?[0-9]+([eE][+-]?[0-9]+)?$ ]]; then
+        echo "$val"
+    else
+        echo "$default"
+    fi
+}
+
 #--- Auto-detect default interface if eth0 doesn't exist -----------------------
 if [[ "$INTERFACE" == "eth0" ]] && ! ip link show eth0 &>/dev/null; then
     INTERFACE=$(ip -4 route show default 2>/dev/null | awk '{print $5; exit}') || true
@@ -212,15 +322,26 @@ if [[ -n "$JSON_DIR" ]]; then
     mkdir -p "$JSON_DIR"
 fi
 
-TMPDIR=$(mktemp -d /tmp/iperf3_test.XXXXXX)
-trap 'rm -rf "$TMPDIR"' EXIT
+TMPDIR=$(mktemp -d /tmp/iperf3_test.XXXXXXXXXX)
+
+# Cleanup trap: kill background iperf3 clients + remove temp dir
+declare -a CLIENT_PIDS=()
+cleanup() {
+    for pid in "${CLIENT_PIDS[@]:-}"; do
+        if [[ -n "$pid" ]]; then
+            kill "$pid" 2>/dev/null || true
+        fi
+    done
+    rm -rf "$TMPDIR"
+}
+trap cleanup EXIT INT TERM HUP
 
 AVAILABLE_CORES=$(nproc)
 TOTAL_STREAMS=$(( INSTANCES * STREAMS_PER ))
 
-hdr "╔══════════════════════════════════════════════════════════════╗"
-hdr "║          iperf3 Multi-Process Bandwidth Test                ║"
-hdr "╚══════════════════════════════════════════════════════════════╝"
+hdr "======================================================================"
+hdr "          iperf3 Multi-Process Bandwidth Test v${SCRIPT_VERSION}"
+hdr "======================================================================"
 echo ""
 info "Server:           $SERVER"
 info "Processes:        $INSTANCES"
@@ -229,14 +350,23 @@ info "Total streams:    $TOTAL_STREAMS"
 info "Duration:         ${DURATION}s"
 info "TCP window:       ${WINDOW:-auto (kernel default)}"
 info "Target:           ${TARGET_GBPS} Gbps"
-info "Port range:       ${BASE_PORT}–$(( BASE_PORT + INSTANCES - 1 ))"
+info "Port range:       ${BASE_PORT}-$(( BASE_PORT + INSTANCES - 1 ))"
 info "CPU affinity:     $CPU_AFFINITY"
 info "Monitor iface:    $INTERFACE"
 info "Available cores:  $AVAILABLE_CORES"
 info "Show raw output:  $SHOW_RAW"
 
+#--- Connectivity pre-check ----------------------------------------------------
+info "Checking connectivity to $SERVER:$BASE_PORT..."
+if ! timeout 3 bash -c "echo >/dev/tcp/$SERVER/$BASE_PORT" 2>/dev/null; then
+    err "Cannot connect to $SERVER:$BASE_PORT — is the server running?"
+    err "Start the server with: ./iperf3_server.sh --instances $INSTANCES --base-port $BASE_PORT"
+    exit 1
+fi
+ok "Server reachable at $SERVER:$BASE_PORT"
+
 #--- System checks -------------------------------------------------------------
-hdr "── Pre-Test System Checks ──"
+hdr "-- Pre-Test System Checks --"
 
 # 1. Kernel TCP tuning
 echo ""
@@ -264,10 +394,10 @@ if (( RMEM_MAX < MIN_BUF || WMEM_MAX < MIN_BUF )); then
     WINDOW_REQUESTED="$WINDOW"
     req_bytes=0
     case "$WINDOW" in
-        *M) req_bytes=$(( ${WINDOW%M} * 1024 * 1024 )) ;;
-        *K) req_bytes=$(( ${WINDOW%K} * 1024 )) ;;
-        *G) req_bytes=$(( ${WINDOW%G} * 1024 * 1024 * 1024 )) ;;
-        *)  req_bytes=$WINDOW ;;
+        *[Mm]) req_bytes=$(( ${WINDOW%[Mm]} * 1024 * 1024 )) ;;
+        *[Kk]) req_bytes=$(( ${WINDOW%[Kk]} * 1024 )) ;;
+        *[Gg]) req_bytes=$(( ${WINDOW%[Gg]} * 1024 * 1024 * 1024 )) ;;
+        *)     req_bytes=${WINDOW:-0} ;;
     esac
     KERN_MAX=$(( RMEM_MAX < WMEM_MAX ? RMEM_MAX : WMEM_MAX ))
     if (( req_bytes > KERN_MAX )); then
@@ -285,7 +415,9 @@ fi
 # 2. MTU check
 echo ""
 if ip link show "$INTERFACE" &>/dev/null; then
-    CURRENT_MTU=$(ip link show "$INTERFACE" | grep -oP 'mtu \K[0-9]+')
+    CURRENT_MTU=$(ip link show "$INTERFACE" | awk '/mtu/{for(i=1;i<=NF;i++) if($i=="mtu") print $(i+1)}')
+    CURRENT_MTU=${CURRENT_MTU:-0}
+    [[ "$CURRENT_MTU" =~ ^[0-9]+$ ]] || CURRENT_MTU=0
     info "Interface $INTERFACE MTU: $CURRENT_MTU"
     if (( CURRENT_MTU < 9000 )); then
         warn "MTU is $CURRENT_MTU. Jumbo frames (9000) recommended for ${TARGET_GBPS}G."
@@ -300,9 +432,7 @@ fi
 if $MTU_CHECK; then
     info "Running MTU path discovery to $SERVER..."
     for sz in 8972 4472 1472; do
-        # Note: confirm_exec runs the command directly, so we wrap ping
-        # in a subshell to suppress its output without swallowing the prompt
-        if confirm_exec "MTU probe (payload=$sz)" bash -c "ping -M do -s $sz -c 1 -W 2 $SERVER &>/dev/null"; then
+        if confirm_exec "MTU probe (payload=$sz)" ping -M "do" -s "$sz" -c 1 -W 2 -- "$SERVER"; then
             ok "Path MTU supports payload size $sz (MTU ~$(( sz + 28 )))"
             break
         else
@@ -325,24 +455,141 @@ if command -v numactl &>/dev/null; then
 fi
 
 # 5. IRQ balance check
+echo ""
 if pgrep irqbalance &>/dev/null; then
-    info "irqbalance is running (OK for general use, may want manual IRQ pinning for ${TARGET_GBPS}G)."
+    ok "irqbalance: running"
 else
-    info "irqbalance is NOT running."
+    warn "irqbalance: NOT running"
+    warn "  Install with: sudo apt-get install -y irqbalance"
+fi
+
+# 6. CPU governor (ESnet: "performance" governor can increase throughput by ~30%)
+CPU_GOV_PATH="/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor"
+if [[ -f "$CPU_GOV_PATH" ]]; then
+    CURRENT_GOV=$(cat "$CPU_GOV_PATH" 2>/dev/null || echo "N/A")
+    AVAIL_GOVS=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_available_governors 2>/dev/null || echo "N/A")
+    if [[ "$CURRENT_GOV" == "performance" ]]; then
+        ok "CPU governor: $CURRENT_GOV"
+    else
+        warn "CPU governor: $CURRENT_GOV (should be 'performance' for up to 30% throughput gain)"
+        warn "  Set with: sudo cpupower frequency-set -g performance"
+        warn "  Or run: sudo ./iperf3_tune_host.sh --apply"
+    fi
+    info "  Available governors: $AVAIL_GOVS"
+else
+    warn "CPU governor: N/A (no cpufreq sysfs — hypervisor-controlled)"
+fi
+
+# 7. NIC driver and firmware
+echo ""
+info "NIC info ($INTERFACE):"
+if ip link show "$INTERFACE" &>/dev/null; then
+    if command -v ethtool &>/dev/null; then
+        drv_info=$(ethtool -i "$INTERFACE" 2>/dev/null) || true
+        if [[ -n "$drv_info" ]]; then
+            drv=$(echo "$drv_info" | awk -F': ' '/^driver:/{print $2}')
+            drv_ver=$(echo "$drv_info" | awk -F': ' '/^version:/{print $2}')
+            fw=$(echo "$drv_info" | awk -F': ' '/^firmware-version:/{print $2}')
+            bus=$(echo "$drv_info" | awk -F': ' '/^bus-info:/{print $2}')
+            printf "  %-20s %s\n" "Driver:" "${drv:-N/A}"
+            printf "  %-20s %s\n" "Driver version:" "${drv_ver:-N/A}"
+            printf "  %-20s %s\n" "Firmware:" "${fw:-N/A}"
+            printf "  %-20s %s\n" "Bus info:" "${bus:-N/A}"
+        else
+            warn "  ethtool -i not supported on $INTERFACE"
+        fi
+    else
+        warn "  ethtool not installed — cannot query NIC driver/firmware"
+        warn "  Install with: sudo apt-get install -y ethtool"
+    fi
+
+    # Link speed
+    if command -v ethtool &>/dev/null; then
+        link_speed=$(ethtool "$INTERFACE" 2>/dev/null | awk '/Speed:/{print $2}') || true
+        link_duplex=$(ethtool "$INTERFACE" 2>/dev/null | awk '/Duplex:/{print $2}') || true
+        printf "  %-20s %s\n" "Link speed:" "${link_speed:-N/A}"
+        printf "  %-20s %s\n" "Duplex:" "${link_duplex:-N/A}"
+    fi
+else
+    warn "  Interface $INTERFACE not found"
+fi
+
+# 8. Netdev budget (ESnet 100G "other tuning")
+echo ""
+info "Netdev budget settings:"
+NETDEV_BUDGET=$(sysctl -n net.core.netdev_budget 2>/dev/null || echo "N/A")
+NETDEV_BUDGET_USECS=$(sysctl -n net.core.netdev_budget_usecs 2>/dev/null || echo "N/A")
+if [[ "$NETDEV_BUDGET" =~ ^[0-9]+$ ]] && (( NETDEV_BUDGET >= 600 )); then
+    ok "netdev_budget: $NETDEV_BUDGET (recommended: >= 600)"
+else
+    warn "netdev_budget: $NETDEV_BUDGET (recommended: 600, default: 300)"
+fi
+if [[ "$NETDEV_BUDGET_USECS" =~ ^[0-9]+$ ]] && (( NETDEV_BUDGET_USECS >= 4000 )); then
+    ok "netdev_budget_usecs: $NETDEV_BUDGET_USECS (recommended: >= 4000)"
+else
+    warn "netdev_budget_usecs: $NETDEV_BUDGET_USECS (recommended: 4000, default: 2000)"
+fi
+
+# 9. TX queue length (ESnet: 10000 for WAN, default 1000 OK for LAN)
+if ip link show "$INTERFACE" &>/dev/null; then
+    CURRENT_TXQLEN=$(ip link show "$INTERFACE" | awk '/qlen/{for(i=1;i<=NF;i++) if($i=="qlen") print $(i+1)}')
+    CURRENT_TXQLEN=${CURRENT_TXQLEN:-1000}
+    [[ "$CURRENT_TXQLEN" =~ ^[0-9]+$ ]] || CURRENT_TXQLEN=1000
+    if (( CURRENT_TXQLEN >= 10000 )); then
+        ok "txqueuelen ($INTERFACE): $CURRENT_TXQLEN (recommended: 10000)"
+    else
+        warn "txqueuelen ($INTERFACE): $CURRENT_TXQLEN (recommended: 10000)"
+        warn "  Set with: sudo ip link set $INTERFACE txqueuelen 10000"
+    fi
+fi
+
+# 10. NIC offload settings (ESnet: LRO off, GRO on)
+echo ""
+info "NIC offload settings ($INTERFACE):"
+if ip link show "$INTERFACE" &>/dev/null && command -v ethtool &>/dev/null; then
+    offload_info=$(ethtool -k "$INTERFACE" 2>/dev/null) || true
+    if [[ -n "$offload_info" ]]; then
+        for feat in tcp-segmentation-offload generic-receive-offload large-receive-offload tx-checksumming rx-checksumming; do
+            val=$(echo "$offload_info" | grep "^${feat}:" | awk '{print $2}')
+            case "$feat" in
+                large-receive-offload)
+                    if [[ "$val" == "off" ]]; then
+                        ok "  $feat: $val (recommended: off)"
+                    else
+                        warn "  $feat: $val (recommended: off)"
+                        warn "    Set with: sudo ethtool -K $INTERFACE lro off"
+                    fi
+                    ;;
+                generic-receive-offload)
+                    if [[ "$val" == "on" ]]; then
+                        ok "  $feat: $val (recommended: on)"
+                    else
+                        warn "  $feat: $val (recommended: on)"
+                        warn "    Set with: sudo ethtool -K $INTERFACE gro on"
+                    fi
+                    ;;
+                *)
+                    info "  $feat: ${val:-N/A}"
+                    ;;
+            esac
+        done
+    fi
+elif ! command -v ethtool &>/dev/null; then
+    warn "  ethtool not installed — cannot check offloads"
 fi
 
 #--- Capture baseline NIC counters ---------------------------------------------
 TX_BEFORE=$(get_iface_bytes tx_bytes)
 RX_BEFORE=$(get_iface_bytes rx_bytes)
 
-#--- Build command options -----------------------------------------------------
-BIND_OPT=""
-[[ -n "$BIND_ADDR" ]] && BIND_OPT="--bind $BIND_ADDR"
-WINDOW_OPT=""
-[[ -n "$WINDOW" ]] && WINDOW_OPT="-w $WINDOW"
+#--- Build command options (arrays for safe quoting) ---------------------------
+BIND_OPTS=()
+[[ -n "$BIND_ADDR" ]] && BIND_OPTS=(--bind "$BIND_ADDR")
+WINDOW_OPTS=()
+[[ -n "$WINDOW" ]] && WINDOW_OPTS=(-w "$WINDOW")
 
 #--- Launch clients ------------------------------------------------------------
-hdr "── Running Test ──"
+hdr "-- Running Test --"
 echo ""
 
 # Preview all commands
@@ -352,7 +599,7 @@ for (( i=0; i<INSTANCES; i++ )); do
     core=$(( i % AVAILABLE_CORES ))
     label="s$(( i+1 ))"
     outfile="\${TMPDIR}/iperf3_${label}.json"
-    base_cmd="iperf3 -c $SERVER -p $port -P $STREAMS_PER -t $DURATION $WINDOW_OPT -J $BIND_OPT"
+    base_cmd="iperf3 -c $SERVER -p $port -P $STREAMS_PER -t $DURATION ${WINDOW_OPTS[*]:-} -J ${BIND_OPTS[*]:-}"
     if $CPU_AFFINITY; then
         echo -e "    ${DIM}\$ taskset -c $core $base_cmd > $outfile &${RST}"
     else
@@ -378,7 +625,6 @@ echo ""
 info "Launching $INSTANCES iperf3 client processes..."
 echo ""
 
-declare -a CLIENT_PIDS=()
 for (( i=0; i<INSTANCES; i++ )); do
     port=$(( BASE_PORT + i ))
     core=$(( i % AVAILABLE_CORES ))
@@ -387,23 +633,27 @@ for (( i=0; i<INSTANCES; i++ )); do
 
     if $CPU_AFFINITY; then
         taskset -c "$core" iperf3 -c "$SERVER" -p "$port" -P "$STREAMS_PER" \
-            -t "$DURATION" $WINDOW_OPT -J $BIND_OPT > "$outfile" 2>&1 &
+            -t "$DURATION" "${WINDOW_OPTS[@]+"${WINDOW_OPTS[@]}"}" -J "${BIND_OPTS[@]+"${BIND_OPTS[@]}"}" > "$outfile" 2>&1 &
     else
         iperf3 -c "$SERVER" -p "$port" -P "$STREAMS_PER" \
-            -t "$DURATION" $WINDOW_OPT -J $BIND_OPT > "$outfile" 2>&1 &
+            -t "$DURATION" "${WINDOW_OPTS[@]+"${WINDOW_OPTS[@]}"}" -J "${BIND_OPTS[@]+"${BIND_OPTS[@]}"}" > "$outfile" 2>&1 &
     fi
     CLIENT_PIDS+=($!)
 
     aff_msg=""
-    $CPU_AFFINITY && aff_msg=" → core $core"
+    $CPU_AFFINITY && aff_msg=" -> core $core"
+    log_action "CLIENT: iperf3 -c $SERVER -p $port -P $STREAMS_PER -t $DURATION ${WINDOW_OPTS[*]:-} -J ${BIND_OPTS[*]:-} (PID ${CLIENT_PIDS[-1]})"
     info "  Process $label  port=$port  PID=${CLIENT_PIDS[-1]}${aff_msg}"
 done
 
 echo ""
 info "All $INSTANCES processes launched. Waiting ${DURATION}s for completion..."
 
-#--- Progress indicator --------------------------------------------------------
+#--- Progress indicator with spinner -------------------------------------------
+SPINNER_CHARS=$'|/-\\'
+SPIN_IDX=0
 ELAPSED=0
+START_TS=$(date +%s)
 while (( ELAPSED < DURATION + 5 )); do
     ALL_DONE=true
     for pid in "${CLIENT_PIDS[@]}"; do
@@ -414,11 +664,14 @@ while (( ELAPSED < DURATION + 5 )); do
     done
     $ALL_DONE && break
 
-    printf "\r  [%3ds / %ds]  " "$ELAPSED" "$DURATION"
-    sleep 5
-    ELAPSED=$(( ELAPSED + 5 ))
+    NOW_TS=$(date +%s)
+    ELAPSED=$(( NOW_TS - START_TS ))
+    SPIN_CHAR="${SPINNER_CHARS:SPIN_IDX%4:1}"
+    SPIN_IDX=$(( SPIN_IDX + 1 ))
+    printf "\r  %s [%3ds / %ds]  " "$SPIN_CHAR" "$ELAPSED" "$DURATION"
+    sleep 1
 done
-echo ""
+printf "\r  done.                          \n"
 
 #--- Wait for all processes and collect exit codes -----------------------------
 declare -a EXIT_CODES=()
@@ -432,12 +685,12 @@ RX_AFTER=$(get_iface_bytes rx_bytes)
 
 #--- Show raw output if requested ----------------------------------------------
 if $SHOW_RAW; then
-    hdr "── Raw iperf3 Output (per-process) ──"
+    hdr "-- Raw iperf3 Output (per-process) --"
     for (( i=0; i<INSTANCES; i++ )); do
         label="s$(( i+1 ))"
         outfile="${TMPDIR}/iperf3_${label}.json"
         echo ""
-        echo -e "  ${BLD}── Process $label (port $(( BASE_PORT + i ))) ──${RST}"
+        echo -e "  ${BLD}-- Process $label (port $(( BASE_PORT + i ))) --${RST}"
         if [[ -s "$outfile" ]]; then
             json_pretty "$outfile"
         else
@@ -447,7 +700,7 @@ if $SHOW_RAW; then
 fi
 
 #--- Parse results -------------------------------------------------------------
-hdr "── Results ──"
+hdr "-- Results --"
 echo ""
 
 TOTAL_SENT_BYTES=0
@@ -464,7 +717,7 @@ for (( i=0; i<INSTANCES; i++ )); do
     outfile="${TMPDIR}/iperf3_${label}.json"
 
     if [[ ! -s "$outfile" ]]; then
-        printf "  %-8s %15s %15s %12s %8s\n" "$label" "—" "—" "—" "NO DATA"
+        printf "  %-8s %15s %15s %12s %8s\n" "$label" "---" "---" "---" "NO DATA"
         FAILED_COUNT=$(( FAILED_COUNT + 1 ))
         continue
     fi
@@ -482,6 +735,10 @@ for (( i=0; i<INSTANCES; i++ )); do
     recv_bps=$(json_val "$outfile" "end.sum_received.bits_per_second" 0)
     retrans=$(json_val "$outfile" "end.sum_sent.retransmits" 0)
 
+    # Validate bc inputs
+    sent_bps=$(safe_number "$sent_bps" 0)
+    recv_bps=$(safe_number "$recv_bps" 0)
+
     sent_gbps=$(echo "scale=2; $sent_bps / 1000000000" | bc)
     recv_gbps=$(echo "scale=2; $recv_bps / 1000000000" | bc)
 
@@ -489,9 +746,9 @@ for (( i=0; i<INSTANCES; i++ )); do
     recv_bytes=$(json_val "$outfile" "end.sum_received.bytes" 0)
 
     # Sanitize to integers
-    sent_bytes=$(printf '%.0f' "$sent_bytes" 2>/dev/null || echo 0)
-    recv_bytes=$(printf '%.0f' "$recv_bytes" 2>/dev/null || echo 0)
-    retrans=$(printf '%.0f' "$retrans" 2>/dev/null || echo 0)
+    sent_bytes=$(printf '%.0f' "$(safe_number "$sent_bytes" 0)" 2>/dev/null || echo 0)
+    recv_bytes=$(printf '%.0f' "$(safe_number "$recv_bytes" 0)" 2>/dev/null || echo 0)
+    retrans=$(printf '%.0f' "$(safe_number "$retrans" 0)" 2>/dev/null || echo 0)
 
     TOTAL_SENT_BYTES=$(( TOTAL_SENT_BYTES + sent_bytes ))
     TOTAL_RECV_BYTES=$(( TOTAL_RECV_BYTES + recv_bytes ))
@@ -507,16 +764,20 @@ done
 echo ""
 
 # Aggregate
+EXIT_RC=0
 if (( PROCESS_COUNT > 0 )); then
     AGG_SENT_GBPS=$(echo "scale=2; $TOTAL_SENT_BYTES * 8 / $DURATION / 1000000000" | bc)
     AGG_RECV_GBPS=$(echo "scale=2; $TOTAL_RECV_BYTES * 8 / $DURATION / 1000000000" | bc)
     AGG_SENT_GB=$(echo "scale=2; $TOTAL_SENT_BYTES / 1073741824" | bc)
     AGG_RECV_GB=$(echo "scale=2; $TOTAL_RECV_BYTES / 1073741824" | bc)
 
-    printf "  ${BLD}%-8s %12.2f    %12.2f    %12d${RST}\n" "TOTAL" "$AGG_SENT_GBPS" "$AGG_RECV_GBPS" "$TOTAL_RETRANSMITS"
+    # Print TOTAL row with BLD outside printf field widths for alignment
+    echo -ne "  ${BLD}"
+    printf "%-8s %12.2f    %12.2f    %12d" "TOTAL" "$AGG_SENT_GBPS" "$AGG_RECV_GBPS" "$TOTAL_RETRANSMITS"
+    echo -e "${RST}"
     echo ""
-    info "Aggregate sent:     ${AGG_SENT_GB} GB  →  ${AGG_SENT_GBPS} Gbps"
-    info "Aggregate received: ${AGG_RECV_GB} GB  →  ${AGG_RECV_GBPS} Gbps"
+    info "Aggregate sent:     ${AGG_SENT_GB} GB  ->  ${AGG_SENT_GBPS} Gbps"
+    info "Aggregate received: ${AGG_RECV_GB} GB  ->  ${AGG_RECV_GBPS} Gbps"
     info "Total retransmits:  $TOTAL_RETRANSMITS"
 
     # NIC-level sanity check (only if interface exists)
@@ -526,11 +787,12 @@ if (( PROCESS_COUNT > 0 )); then
         NIC_TX_GBPS=$(echo "scale=2; $TX_DELTA * 8 / $DURATION / 1000000000" | bc)
         NIC_RX_GBPS=$(echo "scale=2; $RX_DELTA * 8 / $DURATION / 1000000000" | bc)
         echo ""
-        info "NIC-level TX delta ($INTERFACE): $(echo "scale=2; $TX_DELTA / 1073741824" | bc) GB → ${NIC_TX_GBPS} Gbps"
-        info "NIC-level RX delta ($INTERFACE): $(echo "scale=2; $RX_DELTA / 1073741824" | bc) GB → ${NIC_RX_GBPS} Gbps"
+        info "NIC-level TX delta ($INTERFACE): $(echo "scale=2; $TX_DELTA / 1073741824" | bc) GB -> ${NIC_TX_GBPS} Gbps"
+        info "NIC-level RX delta ($INTERFACE): $(echo "scale=2; $RX_DELTA / 1073741824" | bc) GB -> ${NIC_RX_GBPS} Gbps"
     fi
 else
     err "No successful iperf3 processes. Check server connectivity."
+    EXIT_RC=1
 fi
 
 if (( FAILED_COUNT > 0 )); then
@@ -538,7 +800,7 @@ if (( FAILED_COUNT > 0 )); then
 fi
 
 #--- Throughput assessment -----------------------------------------------------
-hdr "── Assessment ──"
+hdr "-- Assessment --"
 echo ""
 if (( PROCESS_COUNT > 0 )); then
     PASS_THRESHOLD=$(echo "scale=0; $TARGET_GBPS * 95 / 100" | bc)
@@ -549,9 +811,11 @@ if (( PROCESS_COUNT > 0 )); then
     elif (( $(echo "$AGG_SENT_GBPS >= $WARN_THRESHOLD" | bc -l) )); then
         warn "Throughput ${AGG_SENT_GBPS} Gbps — ${PCT}% of ${TARGET_GBPS}G target."
         warn "Possible bottlenecks: VNIC caps, TCP tuning, NUMA locality, or IRQ affinity."
+        EXIT_RC=2
     else
         err "Throughput ${AGG_SENT_GBPS} Gbps — only ${PCT}% of ${TARGET_GBPS}G target."
         err "Likely hitting per-VNIC bandwidth cap. See remediation below."
+        EXIT_RC=2
     fi
 fi
 
@@ -569,7 +833,8 @@ if [[ -n "$JSON_DIR" ]]; then
 fi
 
 #--- Remediation guidance ------------------------------------------------------
-hdr "── Remediation Checklist (if below target) ──"
+hdr "-- Remediation Checklist (if below target) --"
+iface_display="$INTERFACE"
 cat <<GUIDANCE
 
   1. VNIC CAPS: Each OCI VNIC is capped at ~25 Gbps. To reach ${TARGET_GBPS}G aggregate,
@@ -584,7 +849,7 @@ cat <<GUIDANCE
        sudo sysctl -w net.ipv4.tcp_congestion_control=bbr
 
   3. JUMBO FRAMES: Set MTU 9000 on both ends and all intermediate hops:
-       sudo ip link set $INTERFACE mtu 9000
+       sudo ip link set ${iface_display} mtu 9000
 
   4. IRQ AFFINITY: Distribute NIC interrupts across cores:
        sudo apt-get install -y irqbalance
@@ -593,7 +858,22 @@ cat <<GUIDANCE
   5. NUMA PINNING: Run iperf3 on the NUMA node that owns the NIC:
        numactl --cpunodebind=<NIC_NUMA> --membind=<NIC_NUMA> iperf3 ...
 
-  6. MULTI-VNIC TESTING: To test aggregate across VNICs, run separate
+  6. CPU GOVERNOR: Set governor to 'performance' for up to 30% throughput gain:
+       sudo cpupower frequency-set -g performance
+     Verify with: cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor
+
+  7. NETDEV BUDGET & TX QUEUE: Increase for WAN/100G+ paths:
+       sudo sysctl -w net.core.netdev_budget=600
+       sudo sysctl -w net.core.netdev_budget_usecs=4000
+       sudo ip link set ${iface_display} txqueuelen 10000
+
+  8. NIC OFFLOADS: LRO off, GRO on (ESnet recommendation for 100G+):
+       sudo ethtool -K ${iface_display} lro off
+       sudo ethtool -K ${iface_display} gro on
+
+  9. MULTI-VNIC TESTING: To test aggregate across VNICs, run separate
      iperf3 processes bound to each VNIC IP (--bind flag).
 GUIDANCE
 echo ""
+
+exit $EXIT_RC
